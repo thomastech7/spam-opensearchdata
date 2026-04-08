@@ -1,0 +1,12 @@
+python3 os_autoscale_tester_v2_multi.py \
+  --scheme https \
+  --host 192.168.1.230 \
+  --port 9200 \
+  --index logs_web_access_logs \
+  --user customer_admin \
+  --password "Cmc080426@@@" \
+  --batch-size 1000 \
+  --delay 0.001 \
+  --workers 2 \
+  --log-file opensearch_test.log \
+  --skip-create-index
