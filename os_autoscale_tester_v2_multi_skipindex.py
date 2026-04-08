@@ -40,7 +40,7 @@ def get_client(args):
     client_kwargs = {
         'hosts': [{'host': args.host, 'port': args.port}],
         'http_auth': (args.user, args.password),
-        'timeout': 30  # Increased timeout for heavy loads
+        'timeout': 30  
     }
     
     if args.scheme == 'https':
@@ -55,7 +55,7 @@ def get_client(args):
 
     return OpenSearch(**client_kwargs)
 
-def load_generator_worker(worker_id, args, stop_event):
+def load_generator_worker(worker_id, args, stop_event, shared_counter):
     """The function executed by each multiprocessing worker."""
     client = get_client(args)
     
@@ -65,18 +65,22 @@ def load_generator_worker(worker_id, args, stop_event):
                 {"_index": args.index, "_source": generate_pseudo_log()}
                 for _ in range(args.batch_size)
             ]
-            # Execute the bulk request directly
+            # Execute the bulk request
             helpers.bulk(client, actions, stats_only=True)
+            
+            # Safely increment the shared counter across processes
+            with shared_counter.get_lock():
+                shared_counter.value += args.batch_size
+                
             time.sleep(args.delay)
             
         except Exception as err:
-            # If the cluster is overwhelmed, back off temporarily
+            # If the cluster drops connection, back off temporarily
             time.sleep(5)
-            # Re-initialize client just in case the connection died
             client = get_client(args)
 
 def main():
-    parser = argparse.ArgumentParser(description="Multicore OpenSearch Load Generator")
+    parser = argparse.ArgumentParser(description="Multicore OpenSearch Load Generator (Local Tracking)")
     parser.add_argument('--scheme', choices=['http', 'https'], default='https', help="Connection scheme")
     parser.add_argument('--host', required=True, help="OpenSearch IP or Hostname")
     parser.add_argument('--port', type=int, default=9200, help="OpenSearch Port")
@@ -87,7 +91,7 @@ def main():
     parser.add_argument('--delay', type=float, default=0.1, help="Delay between bulk requests per worker")
     parser.add_argument('--workers', type=int, default=4, help="Number of concurrent processes to spawn")
     parser.add_argument('--log-file', default='os_autoscale_events.txt', help="File to save script logs")
-    parser.add_argument('--skip-create-index', action='store_true', help="Skip explicit index creation (useful for restricted RBAC users)")
+    parser.add_argument('--skip-create-index', action='store_true', help="Skip explicit index creation")
 
     args = parser.parse_args()
 
@@ -103,13 +107,11 @@ def main():
         if not main_client.ping():
             raise Exception("Ping returned False. Server rejected the connection.")
             
-        # NEW LOGIC: Handle restricted permissions cleanly
         if not args.skip_create_index:
             try:
-                # ignore=400 (already exists), ignore=403 (forbidden/no permission to create)
                 main_client.indices.create(index=args.index, ignore=[400, 403])
-            except Exception as e:
-                print(f"[*] Could not create index (it likely already exists or permissions are restricted). Continuing...")
+            except Exception:
+                pass
         else:
             print("[*] Skipping index creation step as requested.")
             
@@ -126,38 +128,36 @@ def main():
 
     # Multiprocessing setup
     stop_event = multiprocessing.Event()
+    # Create a shared variable (unsigned long long) to count documents safely across all workers
+    total_docs_inserted = multiprocessing.Value('Q', 0) 
     processes = []
 
-    # Spawn the workers
+    # Spawn the workers, passing the shared counter to them
     for i in range(args.workers):
-        p = multiprocessing.Process(target=load_generator_worker, args=(i, args, stop_event))
+        p = multiprocessing.Process(target=load_generator_worker, args=(i, args, stop_event, total_docs_inserted))
         p.start()
         processes.append(p)
 
     # Main process monitoring loop
     try:
         while True:
-            time.sleep(2) # Poll OpenSearch every 2 seconds
-            try:
-                stats = main_client.indices.stats(index=args.index)
-                docs_count = stats['indices'][args.index]['primaries']['docs']['count']
-                size_mb = round(stats['indices'][args.index]['total']['store']['size_in_bytes'] / (1024 * 1024), 2)
-                
-                now_str = datetime.now().strftime('%H:%M:%S')
-                print(f"[{now_str}] Live Cluster Stats -> Total Docs: {docs_count:,} | Disk Footprint: {size_mb} MB", end='\r')
-            except Exception as e:
-                # Often happens if the user lacks monitoring permissions, we catch it so it doesn't crash the script
-                print(f"\n[*] Warning: Could not fetch real-time stats (Cluster overwhelmed or missing 'indices:monitor/stats' permission).")
-                time.sleep(5)
+            time.sleep(1) # Update the console every 1 second
+            now_str = datetime.now().strftime('%H:%M:%S')
+            
+            # Read the current value of the shared counter
+            current_count = total_docs_inserted.value
+            
+            print(f"[{now_str}] Live Progress -> Total Docs Sent by Script: {current_count:,}", end='\r')
 
     except KeyboardInterrupt:
         print("\n\n[*] Stopping all workers gracefully (this may take a few seconds)...")
-        logging.info("Load test stopped by user.")
+        final_count = total_docs_inserted.value
+        logging.info(f"Load test stopped by user. Total docs sent: {final_count}")
         stop_event.set()
         
         for p in processes:
             p.join()
-        print("All processes terminated. Exit complete.")
+        print(f"All processes terminated. Final Document Count: {final_count:,}")
 
 if __name__ == "__main__":
     main()
